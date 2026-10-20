@@ -3,6 +3,8 @@
  *   fanctl set <rpm|max>     force all fans to rpm (needs root)
  *   fanctl auto              hand fans back to macOS (needs root)
  *   fanctl keys              dump all readable numeric keys
+ *   fanctl purge             flush inactive/cached memory (needs root)
+ *   fanctl lowpower <0|1>    toggle macOS Low Power Mode (needs root)
  */
 #include "smc.h"
 #include <stdio.h>
@@ -109,7 +111,25 @@ static int cmd_keys(void) {
     return 0;
 }
 
+/* Runs a fixed system tool as full root (setuid only raises the effective uid). */
+static int exec_root(const char *path, char *const args[]) {
+    if (setuid(0) != 0) { fprintf(stderr, "Needs root\n"); return 1; }
+    execv(path, args);
+    perror(path);
+    return 1;
+}
+
 int main(int argc, char **argv) {
+    /* Non-SMC commands; arguments are validated so the setuid helper can't run anything else. */
+    if (argc > 1 && !strcmp(argv[1], "purge")) {
+        char *args[] = { "purge", NULL };
+        return exec_root("/usr/sbin/purge", args);
+    }
+    if (argc > 2 && !strcmp(argv[1], "lowpower") && (!strcmp(argv[2], "0") || !strcmp(argv[2], "1"))) {
+        char *args[] = { "pmset", "-a", "lowpowermode", argv[2], NULL };
+        return exec_root("/usr/bin/pmset", args);
+    }
+
     if (!smc_open()) { fprintf(stderr, "Cannot open AppleSMC\n"); return 1; }
     int rc = 2;
     const char *cmd = argc > 1 ? argv[1] : "status";
@@ -117,7 +137,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "set") && argc > 2) rc = cmd_set(argv[2]);
     else if (!strcmp(cmd, "auto")) rc = cmd_auto();
     else if (!strcmp(cmd, "keys")) rc = cmd_keys();
-    else fprintf(stderr, "usage: fanctl [status | set <rpm|max> | auto | keys]\n");
+    else fprintf(stderr, "usage: fanctl [status | set <rpm|max> | auto | keys | purge | lowpower <0|1>]\n");
     smc_close();
     return rc;
 }

@@ -11,11 +11,13 @@ A free, open-source menu-bar app for Apple Silicon Macs (M1/M2/M3…) that shows
   - **Pro** — fans follow CPU temperature on an aggressive, adjustable curve (ramp-up and full-speed temperatures) for sustained heavy work.
   - **Max** — full speed.
   - **Custom** — pick any fixed speed.
+- **RAM optimizer** — see your top memory-hungry apps (helper processes like browser tabs are counted toward their app), quit them in one click, and flush cached memory with **Free Up RAM**.
+- **Performance tab** — one-tap **Turbo** (Low Power Mode off + Pro fan curve + no idle sleep), plus separate Low Power Mode and Keep Awake switches.
 - **One-time password** — a small root-owned helper is installed once; mode changes never prompt again.
 - **Open at login**, and your last mode is restored at startup and after sleep.
 - **Quit** always hands the fans back to Normal.
 
-> **About performance:** Apple Silicon can't be overclocked. More airflow only helps under *sustained* load, where it reduces thermal throttling so the chip holds its top clock speed for longer. Fanless Macs (e.g. MacBook Air M1) have no fans to control.
+> **About performance:** Apple Silicon can't be overclocked — clock speeds are locked by Apple, and any app claiming otherwise is fake. More airflow only helps under *sustained* load, where it reduces thermal throttling so the chip holds its top clock speed for longer. Fanless Macs (e.g. MacBook Air M1) have no fans to control.
 
 ## Build & install
 
@@ -38,6 +40,8 @@ fanctl status        # JSON: temperatures + fans
 fanctl set 3000      # all fans to 3000 RPM (or "max"); needs root
 fanctl auto          # back to Apple's control; needs root
 fanctl keys          # dump all readable SMC sensors
+fanctl purge         # flush cached memory; needs root
+fanctl lowpower 0|1  # toggle Low Power Mode; needs root
 ```
 
 ## How it works
@@ -45,6 +49,7 @@ fanctl keys          # dump all readable SMC sensors
 - `Sources/smc.c` — talks to the Apple SMC through IOKit (read/write keys such as `F0Ac`, `F0Tg`, `F0Md`, `Ftst`).
 - `Sources/fanctl.c` — the CLI / privileged helper.
 - `Sources/FanPilotApp.swift` — app model: polling, modes, Pro curve, helper install, login item.
+- `Sources/SystemTools.swift` — RAM optimizer, Low Power Mode, Turbo, keep-awake.
 - `Sources/MenuView.swift` — the SwiftUI menu-bar panel.
 
 ## Disclaimer

@@ -19,7 +19,7 @@ enum Mode: String, CaseIterable, Identifiable {
 }
 
 struct Memory {
-    let used, total, swapUsed: Double   // bytes
+    let used, total, swapUsed, free: Double   // bytes
 
     static func read() -> Memory? {
         var stats = vm_statistics64()
@@ -39,7 +39,8 @@ struct Memory {
         var size = MemoryLayout<xsw_usage>.size
         sysctlbyname("vm.swapusage", &swap, &size, nil, 0)
 
-        return Memory(used: used, total: Double(ProcessInfo.processInfo.physicalMemory), swapUsed: Double(swap.xsu_used))
+        return Memory(used: used, total: Double(ProcessInfo.processInfo.physicalMemory), swapUsed: Double(swap.xsu_used),
+                      free: Double(stats.free_count) * page)
     }
 }
 
@@ -172,10 +173,15 @@ final class FanModel: ObservableObject {
         return installed == bundled
     }
 
+    /// Makes sure the setuid helper is installed and current (prompts for a password only when it isn't).
+    func ensureHelper() -> Bool {
+        helperIsCurrent || installHelper()
+    }
+
     /// Runs fanctl as root via the setuid helper, installing (or updating) it first if needed.
     @discardableResult
     func runPrivileged(_ args: [String]) -> Bool {
-        if !helperIsCurrent && !installHelper() { return false }
+        if !ensureHelper() { return false }
         let (code, _) = run(Self.helper, args)
         error = code == 0 ? nil : "Fan control failed (exit \(code))."
         return code == 0
@@ -225,14 +231,21 @@ final class FanModel: ObservableObject {
 
 @main
 struct FanPilotApp: App {
-    @StateObject private var model = FanModel()
+    @StateObject private var model: FanModel
+    @StateObject private var tools: ToolsModel
+
+    init() {
+        let fans = FanModel()
+        _model = StateObject(wrappedValue: fans)
+        _tools = StateObject(wrappedValue: ToolsModel(fans: fans))
+    }
 
     var body: some Scene {
         MenuBarExtra {
-            MenuView(model: model)
+            MenuView(model: model, tools: tools)
         } label: {
             let t = model.status.map { "\(Int($0.cpuAvg))°" } ?? ""
-            Label(t, systemImage: model.mode == .normal ? "fan" : "fan.fill")
+            Label(t, systemImage: tools.turbo ? "bolt.fill" : model.mode == .normal ? "fan" : "fan.fill")
                 .labelStyle(.titleAndIcon)
         }
         .menuBarExtraStyle(.window)

@@ -167,8 +167,22 @@ private struct ModeTile: View {
 
 // MARK: - Main panel
 
+enum Tab: String, CaseIterable, Identifiable {
+    case fans = "Fans", memory = "Memory", performance = "Performance"
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .fans: "fan.fill"
+        case .memory: "memorychip.fill"
+        case .performance: "bolt.fill"
+        }
+    }
+}
+
 struct MenuView: View {
     @ObservedObject var model: FanModel
+    @ObservedObject var tools: ToolsModel
+    @AppStorage("tab") private var tab: Tab = .fans
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -188,14 +202,55 @@ struct MenuView: View {
                         }
                     }
                 }
-                if let m = model.memory, m.swapUsed > 0 {
-                    Label("Swap in use: \(gb(m.swapUsed)) GB", systemImage: "internaldrive")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(m.swapUsed > m.total * 0.25 ? .orange : .secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.top, -4)
+            } else {
+                Card {
+                    HStack { ProgressView().controlSize(.small); Text("Reading sensors…").foregroundStyle(.secondary) }
                 }
+            }
 
+            tabBar
+
+            switch tab {
+            case .fans: fansTab
+            case .memory: memoryTab
+            case .performance: performanceTab
+            }
+
+            if let e = model.error {
+                Label(e, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5)).foregroundStyle(.red)
+            }
+
+            footer
+        }
+        .padding(14)
+        .frame(width: 330)
+        .animation(.easeInOut(duration: 0.2), value: tab)
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 2) {
+            ForEach(Tab.allCases) { t in
+                Button { tab = t } label: {
+                    Label(t.rawValue, systemImage: t.symbol)
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 26)
+                        .foregroundStyle(tab == t ? Color.primary : Color.secondary)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(tab == t ? Color.primary.opacity(0.1) : .clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
+    }
+
+    // MARK: Fans tab
+
+    @ViewBuilder private var fansTab: some View {
+        if let s = model.status {
                 Card {
                     VStack(spacing: 12) {
                         if s.fans.isEmpty {
@@ -208,12 +263,7 @@ struct MenuView: View {
                         }
                     }
                 }
-            } else {
-                Card {
-                    HStack { ProgressView().controlSize(.small); Text("Reading sensors…").foregroundStyle(.secondary) }
-                }
-            }
-
+        }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     ForEach(Mode.allCases) { m in
@@ -248,17 +298,143 @@ struct MenuView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Mode.normal.tint)
                 }
-                if let e = model.error {
-                    Label(e, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10.5)).foregroundStyle(.red)
-                }
             }
             .animation(.easeInOut(duration: 0.2), value: model.mode)
 
-            footer
+    }
+
+    // MARK: Memory tab
+
+    private var memoryTab: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Card {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let m = model.memory {
+                        HStack {
+                            stat("Used", "\(gb(m.used)) GB")
+                            stat("Free", "\(gb(m.free)) GB")
+                            stat("Swap", "\(gb(m.swapUsed)) GB", warn: m.swapUsed > m.total * 0.25)
+                        }
+                    }
+                    Button { tools.optimize() } label: {
+                        HStack(spacing: 6) {
+                            if tools.cleaning { ProgressView().controlSize(.small) }
+                            else { Image(systemName: "sparkles") }
+                            Text(tools.cleaning ? "Cleaning…" : "Free Up RAM")
+                        }
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 32)
+                        .foregroundStyle(.white)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(LinearGradient(colors: [.green.opacity(0.8), .green], startPoint: .top, endPoint: .bottom)))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(tools.cleaning)
+                    if let r = tools.cleanResult {
+                        Label(r, systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 10.5)).foregroundStyle(.green)
+                    }
+                }
+            }
+
+            Text("TOP MEMORY USERS")
+                .font(.system(size: 9.5, weight: .bold)).tracking(0.5).foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
+            Card {
+                VStack(spacing: 8) {
+                    ForEach(tools.topApps) { a in
+                        HStack(spacing: 8) {
+                            Image(nsImage: a.icon).resizable().frame(width: 20, height: 20)
+                            Text(a.name).font(.system(size: 12)).lineLimit(1)
+                            Spacer()
+                            Text("\(gb(a.bytes)) GB")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded)).monospacedDigit()
+                                .foregroundStyle(a.bytes > 2_147_483_648 ? .orange : .primary)
+                            if a.app != nil {
+                                Button { tools.quit(a) } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Quit \(a.name)")
+                            } else {
+                                Color.clear.frame(width: 14, height: 1)
+                            }
+                        }
+                    }
+                }
+            }
+            Text("Quitting heavy apps is what really frees RAM. \"Free Up RAM\" flushes cached memory so new apps launch faster.")
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(14)
-        .frame(width: 330)
+    }
+
+    private func stat(_ label: String, _ value: String, warn: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                .foregroundStyle(warn ? .orange : .primary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Performance tab
+
+    private var performanceTab: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button { tools.setTurbo(!tools.turbo) } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 20, weight: .bold))
+                        .frame(width: 40, height: 40)
+                        .background(Circle().fill(.white.opacity(tools.turbo ? 0.25 : 0)))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tools.turbo ? "Turbo is ON" : "Turbo")
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                        Text(tools.turbo ? "Max sustained performance" : "Tap for maximum sustained performance")
+                            .font(.system(size: 10.5)).opacity(0.8)
+                    }
+                    Spacer()
+                }
+                .padding(12)
+                .foregroundStyle(tools.turbo ? .white : .primary)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(tools.turbo
+                          ? AnyShapeStyle(LinearGradient(colors: [.orange, .pink], startPoint: .topLeading, endPoint: .bottomTrailing))
+                          : AnyShapeStyle(Color.primary.opacity(0.05))))
+                .shadow(color: tools.turbo ? .orange.opacity(0.4) : .clear, radius: 8, y: 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Card {
+                VStack(spacing: 10) {
+                    settingRow("Low Power Mode", "tortoise.fill",
+                               detail: "Slows the CPU to save battery. Off = full speed.",
+                               isOn: Binding(get: { tools.lowPowerMode }, set: { tools.setLowPowerMode($0) }))
+                    Divider()
+                    settingRow("Keep Mac awake", "cup.and.saucer.fill",
+                               detail: "Prevents sleep during long renders and builds.",
+                               isOn: $tools.keepAwake)
+                }
+            }
+
+            Text("Apple Silicon can't be overclocked — clock speeds are locked by Apple. Turbo gets the most out of your chip by keeping Low Power Mode off, running the Pro fan curve so it never throttles, and preventing sleep.")
+                .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func settingRow(_ title: String, _ symbol: String, detail: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 12, weight: .medium))
+                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Toggle(title, isOn: isOn).labelsHidden().toggleStyle(.switch).controlSize(.mini)
+        }
     }
 
     private var header: some View {
