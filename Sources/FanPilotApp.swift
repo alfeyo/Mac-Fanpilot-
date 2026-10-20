@@ -2,13 +2,13 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 
-struct Fan: Decodable, Identifiable {
+struct Fan: Identifiable {
     let id: Int
     let rpm, min, max, target: Double
     let manual: Bool
 }
 
-struct Status: Decodable {
+struct Status {
     let cpuAvg, cpuMax, gpuAvg, gpuMax: Double
     let fans: [Fan]
 }
@@ -18,8 +18,52 @@ enum Mode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Reads the SMC in-process. Temperature sensor keys are discovered once, since walking the
+/// full key table costs thousands of IOKit calls.
+final class Sensors {
+    private let cpuKeys: [String]
+    private let gpuKeys: [String]
+
+    init?() {
+        guard smc_open() else { return nil }
+        cpuKeys = Self.tempKeys("Tp")
+        gpuKeys = Self.tempKeys("Tg")
+    }
+
+    private static func tempKeys(_ prefix: String) -> [String] {
+        var buf = [CChar](repeating: 0, count: 256 * 5)
+        let n = Int(smc_temp_keys(prefix, &buf, 256))
+        return (0..<n).map { i in
+            String(decoding: buf[i * 5 ..< i * 5 + 4].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+    }
+
+    private func temps(_ keys: [String]) -> (avg: Double, max: Double) {
+        let values = keys.map { smc_read_double($0, -1) }.filter { $0 >= 10 && $0 <= 130 }
+        guard !values.isEmpty else { return (0, 0) }
+        return (values.reduce(0, +) / Double(values.count), values.max()!)
+    }
+
+    func read() -> Status {
+        let cpu = temps(cpuKeys), gpu = temps(gpuKeys)
+        let fans = (0..<Int(smc_read_double("FNum", 0))).map { i in
+            Fan(id: i,
+                rpm: smc_read_double("F\(i)Ac", 0),
+                min: smc_read_double("F\(i)Mn", 0),
+                max: smc_read_double("F\(i)Mx", 0),
+                target: smc_read_double("F\(i)Tg", 0),
+                manual: smc_read_double("F\(i)Md", 0) == 1)
+        }
+        return Status(cpuAvg: cpu.avg, cpuMax: cpu.max, gpuAvg: gpu.avg, gpuMax: gpu.max, fans: fans)
+    }
+}
+
 struct Memory {
-    let used, total, swapUsed, free: Double   // bytes
+    let used, total, swapUsed: Double   // bytes
+    /// Truly free pages only — used to measure what a purge released.
+    let free: Double
+    /// Free + reclaimable (inactive, speculative, purgeable) — what new apps can actually get.
+    let available: Double
 
     static func read() -> Memory? {
         var stats = vm_statistics64()
@@ -34,13 +78,16 @@ struct Memory {
         // Same formula as Activity Monitor's "Memory Used": app memory + wired + compressed.
         let app = Double(stats.internal_page_count) - Double(stats.purgeable_count)
         let used = (app + Double(stats.wire_count) + Double(stats.compressor_page_count)) * page
+        let free = Double(stats.free_count) * page
+        let reclaimable = (Double(stats.inactive_count) + Double(stats.speculative_count)
+                           + Double(stats.purgeable_count)) * page
 
         var swap = xsw_usage()
         var size = MemoryLayout<xsw_usage>.size
         sysctlbyname("vm.swapusage", &swap, &size, nil, 0)
 
-        return Memory(used: used, total: Double(ProcessInfo.processInfo.physicalMemory), swapUsed: Double(swap.xsu_used),
-                      free: Double(stats.free_count) * page)
+        return Memory(used: used, total: Double(ProcessInfo.processInfo.physicalMemory),
+                      swapUsed: Double(swap.xsu_used), free: free, available: free + reclaimable)
     }
 }
 
@@ -65,12 +112,18 @@ final class FanModel: ObservableObject {
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
     @Published var error: String?
     private var lastProRPM: Double = 0
+    /// When the chosen mode was last re-sent after macOS took the fans back; throttles retries.
+    private var lastReassert = Date.distantPast
 
+    private let sensors = Sensors()
     private let bundledFanctl = Bundle.main.url(forAuxiliaryExecutable: "fanctl")!.path
     /// Root-owned setuid copy, installed once with a single admin prompt.
     static let helperDir = "/usr/local/libexec/fanpilot"
     static let helper = helperDir + "/fanctl"
+    /// Cached result of the (file-reading) helper check; reset whenever we install or remove it.
+    private var helperCurrentCache: Bool?
     private var timer: Timer?
+    private var sigterm: DispatchSourceSignal?
 
     init() {
         // Start at login by default (only on first run, so turning it off sticks).
@@ -82,21 +135,40 @@ final class FanModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+
+        // Hand the fans back to macOS however the app ends: Quit, logout, shutdown, or SIGTERM (pkill).
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restoreSystemFans() }
+        }
+        signal(SIGTERM, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        src.setEventHandler { NSApp.terminate(nil) }
+        src.resume()
+        sigterm = src
     }
 
     func refresh() {
-        let (_, data) = run(bundledFanctl, ["status"])
-        status = try? JSONDecoder().decode(Status.self, from: data)
+        status = sensors?.read()
         memory = Memory.read()
         guard let s = status else { return }
         if !modeRestored { restoreMode(from: s); return }
         guard mode != .normal, helperIsCurrent else { return }
+
+        // macOS takes the fans back after sleep; re-send the chosen mode, at most every 10 s.
+        let reclaimed = s.fans.contains { !$0.manual }
         if mode == .pro {
             let target = proRPM(for: s)
-            if abs(target - lastProRPM) >= 150 { setFans(target) }
-        } else if s.fans.contains(where: { !$0.manual }) {
-            apply(mode)   // macOS took the fans back (e.g. after sleep) — reassert the chosen mode.
+            if abs(target - lastProRPM) >= 150 || (reclaimed && canReassert()) { setFans(target) }
+        } else if reclaimed, canReassert() {
+            sendFanCommand(for: mode)
         }
+    }
+
+    private func canReassert() -> Bool {
+        guard Date().timeIntervalSince(lastReassert) >= 10 else { return false }
+        lastReassert = Date()
+        return true
     }
 
     private var modeRestored = false
@@ -117,20 +189,28 @@ final class FanModel: ObservableObject {
         else { mode = .custom; customPercent = (pct / 5).rounded() * 5 }
     }
 
-    func apply(_ newMode: Mode) {
-        let args: [String]
-        switch newMode {
-        case .normal: args = ["auto"]
-        case .max: args = ["set", "max"]
-        case .boost: args = ["set", "\(Int(rpm(forPercent: 65)))"]
-        case .custom: args = ["set", "\(Int(rpm(forPercent: customPercent)))"]
+    /// User-initiated mode change. Returns whether the fans accepted it.
+    @discardableResult
+    func apply(_ newMode: Mode) -> Bool {
+        error = nil
+        let ok = sendFanCommand(for: newMode)
+        if ok { mode = newMode }
+        status = sensors?.read()
+        return ok
+    }
+
+    /// Sends the fan command for a mode without touching `mode` or triggering a refresh.
+    @discardableResult
+    private func sendFanCommand(for m: Mode) -> Bool {
+        switch m {
+        case .normal: return runPrivileged(["auto"], failure: "Couldn't return fans to normal.")
+        case .max: return runPrivileged(["set", "max"], failure: "Couldn't set fan speed.")
+        case .boost: return runPrivileged(["set", "\(Int(rpm(forPercent: 65)))"], failure: "Couldn't set fan speed.")
+        case .custom: return runPrivileged(["set", "\(Int(rpm(forPercent: customPercent)))"], failure: "Couldn't set fan speed.")
         case .pro:
-            guard let s = status else { return }
-            lastProRPM = proRPM(for: s)
-            args = ["set", "\(Int(lastProRPM))"]
+            guard let s = status else { return false }
+            return setFans(proRPM(for: s))
         }
-        if runPrivileged(args) { mode = newMode }
-        refresh()
     }
 
     /// Target RPM for Pro mode, driven by the hottest CPU core.
@@ -140,15 +220,20 @@ final class FanModel: ObservableObject {
         return rpm(forPercent: proFloor + (100 - proFloor) * t)
     }
 
-    private func setFans(_ rpm: Double) {
+    @discardableResult
+    private func setFans(_ rpm: Double) -> Bool {
         lastProRPM = rpm
-        runPrivileged(["set", "\(Int(rpm))"])
+        return runPrivileged(["set", "\(Int(rpm))"], failure: "Couldn't set fan speed.")
+    }
+
+    /// Returns fans to Apple's control without changing the saved mode (restored on next launch).
+    func restoreSystemFans() {
+        if mode != .normal, helperIsCurrent { _ = run(Self.helper, ["auto"]) }
     }
 
     func setLaunchAtLogin(_ on: Bool) {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            error = nil
         } catch {
             self.error = "Launch at login: \(error.localizedDescription)"
         }
@@ -165,12 +250,18 @@ final class FanModel: ObservableObject {
 
     /// True when the installed helper is root-owned setuid and byte-identical to the bundled fanctl.
     private var helperIsCurrent: Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: Self.helper),
-              (attrs[.ownerAccountID] as? Int) == 0,
-              let perms = attrs[.posixPermissions] as? Int, perms & 0o4000 != 0,
-              let installed = FileManager.default.contents(atPath: Self.helper),
-              let bundled = FileManager.default.contents(atPath: bundledFanctl) else { return false }
-        return installed == bundled
+        if let cached = helperCurrentCache { return cached }
+        let fm = FileManager.default
+        var current = false
+        if let attrs = try? fm.attributesOfItem(atPath: Self.helper),
+           (attrs[.ownerAccountID] as? Int) == 0,
+           let perms = attrs[.posixPermissions] as? Int, perms & 0o4000 != 0,
+           let installed = fm.contents(atPath: Self.helper),
+           let bundled = fm.contents(atPath: bundledFanctl) {
+            current = installed == bundled
+        }
+        helperCurrentCache = current
+        return current
     }
 
     /// Makes sure the setuid helper is installed and current (prompts for a password only when it isn't).
@@ -179,11 +270,12 @@ final class FanModel: ObservableObject {
     }
 
     /// Runs fanctl as root via the setuid helper, installing (or updating) it first if needed.
+    /// Only sets `error` on failure, so background updates don't wipe out unrelated messages.
     @discardableResult
-    func runPrivileged(_ args: [String]) -> Bool {
-        if !ensureHelper() { return false }
+    func runPrivileged(_ args: [String], failure: String) -> Bool {
+        guard ensureHelper() else { return false }
         let (code, _) = run(Self.helper, args)
-        error = code == 0 ? nil : "Fan control failed (exit \(code))."
+        if code != 0 { error = "\(failure) (exit \(code))" }
         return code == 0
     }
 
@@ -192,11 +284,13 @@ final class FanModel: ObservableObject {
         let src = bundledFanctl.replacingOccurrences(of: "'", with: "'\\''")
         let sh = "mkdir -p \(Self.helperDir) && chown root:wheel \(Self.helperDir) && chmod 755 \(Self.helperDir) && " +
                  "cp '\(src)' \(Self.helper) && chown root:wheel \(Self.helper) && chmod 4755 \(Self.helper)"
-        return admin(sh)
+        helperCurrentCache = nil
+        return admin(sh) && helperIsCurrent
     }
 
     func uninstallHelper() {
         if admin("\(Self.helper) auto; rm -rf \(Self.helperDir)") { mode = .normal }
+        helperCurrentCache = nil
     }
 
     private func admin(_ sh: String) -> Bool {
@@ -211,7 +305,6 @@ final class FanModel: ObservableObject {
             }
             return false
         }
-        error = nil
         return true
     }
 

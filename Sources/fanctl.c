@@ -11,12 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <grp.h>
+#include <limits.h>
 
-static double readd(const char *key, double fallback) {
-    SMCValue v; double d;
-    if (smc_read(key, &v) && smc_value_double(&v, &d)) return d;
-    return fallback;
-}
+#define readd smc_read_double
 
 static int fan_count(void) { return (int)readd("FNum", 0); }
 
@@ -28,14 +26,12 @@ static bool write_float(const char *key, float f) {
 }
 
 static void avg_temps(const char *prefix, double *avg, double *max) {
-    uint32_t n = smc_key_count();
+    char keys[256 * 5];
+    int n = smc_temp_keys(prefix, keys, 256);
     double sum = 0, hi = 0; int cnt = 0;
-    char key[5];
-    for (uint32_t i = 0; i < n; i++) {
-        if (!smc_key_at(i, key) || strncmp(key, prefix, 2) != 0) continue;
-        SMCValue v; double d;
-        if (!smc_read(key, &v) || strcmp(v.type, "flt ") != 0 || !smc_value_double(&v, &d)) continue;
-        if (d < 10 || d > 130) continue;   /* skip unpopulated / bogus sensors */
+    for (int i = 0; i < n; i++) {
+        double d = readd(keys + i * 5, -1);
+        if (d < 10 || d > 130) continue;
         sum += d; cnt++; if (d > hi) hi = d;
     }
     *avg = cnt ? sum / cnt : 0;
@@ -111,15 +107,35 @@ static int cmd_keys(void) {
     return 0;
 }
 
-/* Runs a fixed system tool as full root (setuid only raises the effective uid). */
+/* Runs a fixed system tool as full root (setuid only raises the effective uid).
+ * The caller's environment is dropped so nothing like DYLD_* reaches a root process. */
 static int exec_root(const char *path, char *const args[]) {
+    char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
     if (setuid(0) != 0) { fprintf(stderr, "Needs root\n"); return 1; }
-    execv(path, args);
+    execve(path, args, env);
     perror(path);
     return 1;
 }
 
+/* The helper is setuid root, so privileged commands are limited to root and members of the admin group. */
+static bool caller_is_admin(void) {
+    if (getuid() == 0) return true;
+    struct group *admin = getgrnam("admin");
+    if (!admin) return false;
+    gid_t groups[NGROUPS_MAX];
+    int n = getgroups(NGROUPS_MAX, groups);
+    for (int i = 0; i < n; i++) if (groups[i] == admin->gr_gid) return true;
+    return getgid() == admin->gr_gid;
+}
+
 int main(int argc, char **argv) {
+    const char *first = argc > 1 ? argv[1] : "status";
+    bool privileged = strcmp(first, "status") != 0 && strcmp(first, "keys") != 0;
+    if (privileged && geteuid() == 0 && !caller_is_admin()) {
+        fprintf(stderr, "fanctl: only administrators can change fan or power settings\n");
+        return 1;
+    }
+
     /* Non-SMC commands; arguments are validated so the setuid helper can't run anything else. */
     if (argc > 1 && !strcmp(argv[1], "purge")) {
         char *args[] = { "purge", NULL };

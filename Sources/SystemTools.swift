@@ -19,6 +19,8 @@ final class ToolsModel: ObservableObject {
     @Published var lowPowerMode = false
     @Published var keepAwake = false { didSet { updateSleepAssertion() } }
     @Published var turbo = UserDefaults.standard.bool(forKey: "turbo")
+    /// Whether the menu-bar panel is open; animations and polling stop when it isn't.
+    @Published private(set) var panelVisible = false
 
     let fans: FanModel
     private var sleepAssertion: IOPMAssertionID = 0
@@ -26,11 +28,25 @@ final class ToolsModel: ObservableObject {
 
     init(fans: FanModel) {
         self.fans = fans
+        lowPowerMode = Self.readLowPowerMode()
+        if turbo {
+            // Turbo survives restarts (fan mode is restored by FanModel). didSet doesn't fire inside
+            // our own init, so create the sleep assertion explicitly.
+            keepAwake = true
+            updateSleepAssertion()
+        }
+    }
+
+    /// Process lists and pmset are only polled while the panel is open.
+    func setVisible(_ visible: Bool) {
+        panelVisible = visible
+        timer?.invalidate()
+        timer = nil
+        guard visible else { return }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        if turbo { keepAwake = true }   // Turbo survives restarts; fan mode is restored by FanModel.
     }
 
     func refresh() {
@@ -55,7 +71,7 @@ final class ToolsModel: ObservableObject {
             p.waitUntilExit()
             let ok = p.terminationStatus == 0
             await MainActor.run {
-                let freed = max((Memory.read()?.free ?? 0) - before, 0)
+                let freed = max((Memory.read()?.free ?? 0) - before, 0)   // purge moves cache into free pages
                 self.cleanResult = ok
                     ? String(format: "Freed %.1f GB of cached memory", freed / 1_073_741_824)
                     : "Couldn't clean memory."
@@ -116,25 +132,36 @@ final class ToolsModel: ObservableObject {
         return out.split(separator: "\n").contains { $0.contains("lowpowermode") && $0.hasSuffix("1") }
     }
 
-    func setLowPowerMode(_ on: Bool) {
-        if fans.runPrivileged(["lowpower", on ? "1" : "0"]) { lowPowerMode = on }
+    @discardableResult
+    func setLowPowerMode(_ on: Bool) -> Bool {
+        let ok = fans.runPrivileged(["lowpower", on ? "1" : "0"], failure: "Couldn't change Low Power Mode.")
         lowPowerMode = Self.readLowPowerMode()
+        return ok
     }
 
-    /// Turbo = Low Power Mode off + Pro fan curve + no idle sleep. Turning it off restores the previous fan mode.
+    /// Turbo = Low Power Mode off + Pro fan curve + no idle sleep.
+    /// Turning it off restores the fan mode, Low Power Mode and keep-awake state from before.
     func setTurbo(_ on: Bool) {
+        let d = UserDefaults.standard
         if on {
-            UserDefaults.standard.set(fans.mode.rawValue, forKey: "modeBeforeTurbo")
-            if lowPowerMode { setLowPowerMode(false) }
-            fans.apply(.pro)
+            let prevMode = fans.mode, prevLowPower = lowPowerMode, prevAwake = keepAwake
+            if prevLowPower && !setLowPowerMode(false) { return }
+            guard fans.apply(.pro) else {
+                if prevLowPower { setLowPowerMode(true) }
+                return
+            }
+            d.set(prevMode.rawValue, forKey: "modeBeforeTurbo")
+            d.set(prevLowPower, forKey: "lowPowerBeforeTurbo")
+            d.set(prevAwake, forKey: "awakeBeforeTurbo")
             keepAwake = true
         } else {
-            let prev = Mode(rawValue: UserDefaults.standard.string(forKey: "modeBeforeTurbo") ?? "") ?? .normal
-            fans.apply(prev == .pro ? .normal : prev)
-            keepAwake = false
+            let prev = Mode(rawValue: d.string(forKey: "modeBeforeTurbo") ?? "") ?? .normal
+            fans.apply(prev)
+            if d.bool(forKey: "lowPowerBeforeTurbo") { setLowPowerMode(true) }
+            keepAwake = d.bool(forKey: "awakeBeforeTurbo")
         }
         turbo = on
-        UserDefaults.standard.set(on, forKey: "turbo")
+        d.set(on, forKey: "turbo")
     }
 
     private func updateSleepAssertion() {

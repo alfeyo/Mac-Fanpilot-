@@ -89,8 +89,9 @@ private struct RingGauge: View {
 private struct SpinningFan: View {
     let rpm: Double
     let color: Color
+    let animate: Bool
     var body: some View {
-        TimelineView(.animation(paused: rpm < 1)) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: rpm < 1 || !animate)) { ctx in
             // Visual speed only: ~1 turn/sec at 2400 RPM.
             let angle = ctx.date.timeIntervalSinceReferenceDate * rpm * 0.15
             Image(systemName: "fan.fill")
@@ -107,11 +108,12 @@ private struct FanRow: View {
     let fan: Fan
     let name: String
     let tint: Color
+    let animate: Bool
 
     var body: some View {
         let fraction = fan.max > 0 ? min(fan.rpm / fan.max, 1) : 0
         HStack(spacing: 10) {
-            SpinningFan(rpm: fan.rpm, color: tint)
+            SpinningFan(rpm: fan.rpm, color: tint, animate: animate)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(name).font(.system(size: 12, weight: .medium))
@@ -162,6 +164,49 @@ private struct ModeTile: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.15), value: selected)
+    }
+}
+
+// MARK: - Window visibility
+
+/// Reports whether the hosting window is actually on screen.
+private struct WindowVisibility: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> NSView { Probe(onChange: onChange) }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    final class Probe: NSView {
+        let onChange: (Bool) -> Void
+        private var observer: NSObjectProtocol?
+        private var last: Bool?
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+            super.init(frame: .zero)
+        }
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            guard let window else { report(false); return }
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak self] _ in self?.reportWindow() }
+            reportWindow()
+        }
+
+        private func reportWindow() {
+            report(window.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false)
+        }
+
+        private func report(_ visible: Bool) {
+            guard visible != last else { return }
+            last = visible
+            onChange(visible)
+        }
     }
 }
 
@@ -225,6 +270,9 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 330)
+        // MenuBarExtra keeps this view alive while the panel is closed, so onAppear/onDisappear
+        // aren't reliable; watch the hosting window's real visibility instead.
+        .background(WindowVisibility { tools.setVisible($0) })
         .animation(.easeInOut(duration: 0.2), value: tab)
     }
 
@@ -259,7 +307,8 @@ struct MenuView: View {
                         ForEach(s.fans) { f in
                             FanRow(fan: f,
                                    name: s.fans.count == 2 ? (f.id == 0 ? "Left fan" : "Right fan") : "Fan \(f.id + 1)",
-                                   tint: model.mode.tint)
+                                   tint: model.mode.tint,
+                                   animate: tools.panelVisible)
                         }
                     }
                 }
@@ -312,7 +361,7 @@ struct MenuView: View {
                     if let m = model.memory {
                         HStack {
                             stat("Used", "\(gb(m.used)) GB")
-                            stat("Free", "\(gb(m.free)) GB")
+                            stat("Available", "\(gb(m.available)) GB")
                             stat("Swap", "\(gb(m.swapUsed)) GB", warn: m.swapUsed > m.total * 0.25)
                         }
                     }
@@ -517,8 +566,7 @@ struct MenuView: View {
             }
             Spacer()
             Button {
-                if model.mode != .normal { model.runPrivileged(["auto"]) }
-                NSApp.terminate(nil)
+                NSApp.terminate(nil)   // FanModel hands the fans back to macOS on terminate.
             } label: {
                 Label("Quit", systemImage: "power")
             }

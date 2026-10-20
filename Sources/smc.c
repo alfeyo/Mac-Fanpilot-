@@ -130,3 +130,24 @@ bool smc_value_double(const SMCValue *v, double *out) {
     if (!strcmp(v->type, "sp78")) { *out = (int16_t)((b[0] << 8) | b[1]) / 256.0; return true; }
     return false;
 }
+
+double smc_read_double(const char *key, double fallback) {
+    SMCValue v; double d;
+    if (smc_read(key, &v) && smc_value_double(&v, &d)) return d;
+    return fallback;
+}
+
+int smc_temp_keys(const char *prefix, char *out, int max) {
+    uint32_t n = smc_key_count();
+    int found = 0;
+    char key[5];
+    for (uint32_t i = 0; i < n && found < max; i++) {
+        if (!smc_key_at(i, key) || strncmp(key, prefix, 2) != 0) continue;
+        SMCValue v; double d;
+        if (!smc_read(key, &v) || strcmp(v.type, "flt ") != 0 || !smc_value_double(&v, &d)) continue;
+        if (d < 10 || d > 130) continue;   /* skip unpopulated / bogus sensors */
+        memcpy(out + found * 5, key, 5);
+        found++;
+    }
+    return found;
+}
